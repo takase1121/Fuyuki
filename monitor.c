@@ -324,6 +324,8 @@ static unsigned __stdcall read_input_proc(void *ud) {
                 config->mask |= CONFIG_BACKDROP_TYPE;
             }
 
+            log_response(CMD_CONFIG, "ok%s", "");
+
             WakeConditionVariable(&config->config_changed);
             LeaveCriticalSection(&config->mutex);
         } else if (strncmp(buffer, CMD_THEME, sizeof(CMD_THEME) - 1) == 0) {
