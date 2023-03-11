@@ -3,6 +3,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <windows.h>
 #include <dwmapi.h>
 
@@ -38,10 +39,18 @@ uintptr_t _beginthreadex( // NATIVE CODE
 
 #define MAX_CLASS_SIZE 512
 #define BUFFER_SIZE 512
+
 #define CMD_CONFIG "config"
 #define CMD_THEME "theme"
 #define CMD_EXIT "exit"
 #define CMD_ACCENT "accent"
+
+#define RESPONSE_OK "ok"
+#define RESPONSE_ERROR "error"
+
+#define BROADCAST_THEMECHANGE "themechange"
+#define BROADCAST_ERROR "error"
+#define BROADCAST_READY "ready"
 
 #define WIN10_BUILD_NUMBER 18362
 #define WIN11_BUILD_NUMBER 22000
@@ -79,13 +88,79 @@ typedef struct window_config_s {
 } window_config_t;
 
 
-#define log_ready() (printf("ready\n"))
-#define log_response(cmd, fmt, ...) (printf(cmd " " fmt "\n", __VA_ARGS__))
-#define log_theme(fmt, ...) (printf("themechange " fmt "\n", __VA_ARGS__))
-#define log_error(fmt, ...) (printf("error " fmt "\n", __VA_ARGS__))
+/**
+ * This program communicates via newline (\n) terminated messages.
+ * The message should not exceed 512 bytes in size, including the newline.
+ * The message follows a specific format:
+ * serial " " type " " response?
+ * 
+ * serial refers to an arbitary value that is sent via the client
+ * that is used to identify the response.
+ * This value is preferrably a number, but it can be anything that
+ * does not contains a space (" ") character.
+ * Note that -1 is reserved for broadcasts.
+ * 
+ * type is the type of message or response.
+ * 
+ * Anything after type is intepreted as the content.
+ * This content is delimited by a single space (" ") and can be optional.
+ * "-1 error " is a valid message.
+ * 
+ * A response have the format of:
+ * serial " " status " " message
+ * 
+ * serial is the serial of the incoming message,
+ * while status can be "ok" or "error" to denote a successful or failed operation
+ * respectively.
+ * message is optional, and in case of errors, will be the error message.
+ */
+static void log_response(const char *serial, const char *type, const char *fmt, ...) {
+    va_list ap;
+    printf("%s %s ", serial, type);
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    putc('\n', stdout);
+}
 
 
-static void log_win32_error(const char *function_name, DWORD rc) {
+#define log_broadcast(type, fmt, ...) (printf("-1 " type " " fmt "\n", __VA_ARGS__))
+#define log_error(fmt, ...) (log_broadcast(BROADCAST_ERROR, fmt, __VA_ARGS__))
+
+
+static int parse_message(char *msg, char **serial, char **type, char **content) {
+    char *p, *_serial, *_type, *_content;
+    p = _serial = _type = _content = NULL;
+
+#define NEXT_TOKEN() do { \
+        p = strchr(msg, ' '); \
+        if (!p) return 0; \
+        *p = '\0'; \
+    } while (0)
+#define NEXT_TOKEN_END() msg = p + 1
+
+    // find the serial
+    NEXT_TOKEN();
+    _serial = msg;
+    NEXT_TOKEN_END();
+    // find the type
+    NEXT_TOKEN();
+    _type = msg;
+    NEXT_TOKEN_END();
+    // content is the rest of the string
+    _content = msg;
+
+    *serial = _serial;
+    *type = _type;
+    *content = _content;
+
+    return 1;
+#undef NEXT_TOKEN
+#undef NEXT_TOKEN_END
+}
+
+
+static void log_win32_response(const char *serial, const char *type, const char *function_name, DWORD rc) {
     LPSTR msg = NULL;
     FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER
                     | FORMAT_MESSAGE_FROM_SYSTEM
@@ -96,9 +171,12 @@ static void log_win32_error(const char *function_name, DWORD rc) {
                     (LPSTR) &msg,
                     0,
                     NULL);
-    log_error("%s: %s", function_name, msg ? msg : "unknown error");
+    log_response(serial, type, "%s: %s", function_name, msg ? msg : "unknown error");
     LocalFree(msg);
 }
+
+
+#define log_win32_error(name, rc) (log_win32_response("-1", BROADCAST_ERROR, name, rc))
 
 
 static LSTATUS is_dark_mode(HKEY regkey, int *is_dark) {
@@ -178,7 +256,7 @@ static unsigned __stdcall theme_monitor_proc(void *ud) {
         if (value != config->dark_mode) {
             config->dark_mode = value;
             config->mask |= CONFIG_DARK_MODE;
-            log_theme("%d", config->dark_mode);
+            log_broadcast(BROADCAST_THEMECHANGE, "%d", config->dark_mode);
             WakeConditionVariable(&config->config_changed);
         }
 
@@ -289,88 +367,102 @@ static unsigned __stdcall read_input_proc(void *ud) {
     char buffer[BUFFER_SIZE];
     window_config_t *config = (window_config_t *) ud;
 
-    // FIXME: better input parsing
     while (fgets(buffer, sizeof(buffer), stdin)) {
-        // check if window is valid before we continue processing
+        char *serial, *type, *content, *p;
+
+        // if string ends with newline, remove it
+        p = strrchr(buffer, '\n');
+        if (p)
+            *p = '\0';
+
         EnterCriticalSection(&config->mutex);
+        // check if window is valid before we continue processing
         if (!config->window || !IsWindow(config->window)) {
             LeaveCriticalSection(&config->mutex);
             break;
         }
-        LeaveCriticalSection(&config->mutex);
 
-        if (strncmp(buffer, CMD_CONFIG, sizeof(CMD_CONFIG) - 1) == 0) {
+        if (!parse_message(buffer, &serial, &type, &content)) {
+            log_error("invalid command: \"%s\"", buffer);
+            LeaveCriticalSection(&config->mutex);
+            continue;
+        }
+
+        if (strcmp(type, CMD_CONFIG) == 0) {
             int value;
 
-            if (strlen(buffer) != sizeof(CMD_CONFIG) + 3) { // "config <extend><backdrop_type>"
-                log_error("invalid command: %s", buffer);
+            if (strlen(content) != 2) {
+                log_response(serial, RESPONSE_ERROR, "invalid length: %d", strlen(content));
+                LeaveCriticalSection(&config->mutex);
                 continue;
             }
-            
-            // save the config
-            EnterCriticalSection(&config->mutex);
 
             // extend border
-            value = buffer[sizeof(CMD_CONFIG)] - '0';
+            value = content[0] - '0';
             if (value != config->extend_border) {
                 config->extend_border = !!value;
                 config->mask |= CONFIG_EXTEND_BORDER;
             }
 
             // backdrop type
-            value = buffer[sizeof(CMD_CONFIG) + 1] - '0';
-            if (value >= 0 && value < BACKDROP_MAX && value != config->backdrop_type) {
+            value = content[1] - '0';
+            if (value < 0 || value >= BACKDROP_MAX) {
+                log_response(serial, RESPONSE_ERROR, "invalid backdrop type: %c", content[1]);
+                LeaveCriticalSection(&config->mutex);
+                continue;
+            }
+            if (value != config->backdrop_type) {
                 config->backdrop_type = value;
                 config->mask |= CONFIG_BACKDROP_TYPE;
             }
 
-            log_response(CMD_CONFIG, "ok%s", "");
-
             WakeConditionVariable(&config->config_changed);
-            LeaveCriticalSection(&config->mutex);
-        } else if (strncmp(buffer, CMD_THEME, sizeof(CMD_THEME) - 1) == 0) {
+            log_response(serial, RESPONSE_OK, "");
+        } else if (strcmp(type, CMD_THEME) == 0) {
             int value;
             LRESULT rc;
-            EnterCriticalSection(&config->mutex);
+
             rc = is_dark_mode(config->regkey, &value);
             if (rc != ERROR_SUCCESS) {
-                log_win32_error("is_dark_mode", rc);
+                log_win32_response(serial, RESPONSE_ERROR, "is_dark_mode", rc);
                 LeaveCriticalSection(&config->mutex);
                 break;
             }
-            log_response(CMD_THEME, "%d", value);
-            LeaveCriticalSection(&config->mutex);
+
+            log_response(serial, type, "%d", value);
 #ifdef ENABLE_ACCENT_REPORT
-        } else if (strncmp(buffer, CMD_ACCENT, sizeof(CMD_ACCENT) - 1) == 0) {
+        } else if (strcmp(type, CMD_ACCENT) == 0) {
             int type;
             HRESULT hr;
             uint32_t value = 0;
 
-            if (strlen(buffer) != sizeof(CMD_ACCENT) + 2) {
-                log_error("invalid command: %s", buffer);
+            if (strlen(content) != 1) {
+                log_response(serial, RESPONSE_ERROR, "invalid length: %d", strlen(content));
+                LeaveCriticalSection(&config->mutex);
                 continue;
             }
 
-            type = buffer[sizeof(CMD_ACCENT)] - '0';
+            type = content[0] - '0';
             if (type > COLOR_TYPE_MIN && type < COLOR_TYPE_MAX) {
-                EnterCriticalSection(&config->mutex);
                 hr = winrt_ui_settings_get_color(config->ui_settings, type, &value);
                 if (FAILED(hr)) {
-                    log_win32_error("winrt_ui_settings_get_color", HRESULT_CODE(hr));
+                    log_win32_response(serial, RESPONSE_ERROR, "winrt_ui_settings_get_color", HRESULT_CODE(hr));
                     LeaveCriticalSection(&config->mutex);
                     break;
                 }
-                log_response(CMD_ACCENT, "%d %u", type, value);
-                LeaveCriticalSection(&config->mutex);
+                log_response(serial, RESPONSE_OK, "%u", value);
             } else {
-                log_error("invalid parameter: %c", buffer[sizeof(CMD_ACCENT)]);
+                log_response(serial, RESPONSE_ERROR, "invalid type: %c", content[0]);
             }
 #endif
-        } else if (strncmp(buffer, CMD_EXIT, sizeof(CMD_EXIT) - 1) == 0) {
+        } else if (strcmp(type, CMD_EXIT) == 0) {
+            log_response(serial, RESPONSE_OK, "");
+            LeaveCriticalSection(&config->mutex);
             break;
         } else {
-           log_error("invalid command: %s", buffer);
+            log_response(serial, RESPONSE_ERROR, "invalid command: \"%s\"", type);
         }
+        LeaveCriticalSection(&config->mutex);
     }
     return 0;
 }
@@ -460,7 +552,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    log_ready();
+    log_broadcast(BROADCAST_READY, "%s", "");
 
     rc = WaitForMultipleObjects(sizeof(thread_handles) / sizeof(*thread_handles),
                                 thread_handles,
