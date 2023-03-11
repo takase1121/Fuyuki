@@ -566,9 +566,10 @@ int main(int argc, char **argv) {
         config.regkey = NULL;
         config.window = NULL;
         WakeConditionVariable(&config.config_changed);
+        // workaround: cancel IO in the input thread so it can end immediately
+        CancelSynchronousIo(thread_handles[2]);
         LeaveCriticalSection(&config.mutex);
 
-        fclose(stdin);
 
         // wait for the rest of the threads to quit
         WaitForMultipleObjects(sizeof(thread_handles) / sizeof(*thread_handles),
