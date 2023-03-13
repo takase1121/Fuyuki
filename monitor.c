@@ -8,11 +8,6 @@
 #include <dwmapi.h>
 
 
-#ifdef ENABLE_ACCENT_REPORT
-#include "winrt_ui_settings.h"
-#endif
-
-
 // definitions for DwmSetWindowAttribute
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -77,9 +72,6 @@ typedef struct window_config_s {
     DWORD pid;
     HWND window;
     HKEY regkey;
-#ifdef ENABLE_ACCENT_REPORT
-    winrt_ui_settings_t *ui_settings;
-#endif
     int dark_mode, extend_border;
     window_backdrop_e backdrop_type;
     config_changed_e mask;
@@ -499,14 +491,9 @@ int main(int argc, char **argv) {
     window_config_t config = { 0 };
     HANDLE thread_handles[3] = { INVALID_HANDLE_VALUE };
 
-#ifdef ENABLE_ACCENT_REPORT
-    HRESULT hr;
-    hr = winrt_initialize();
-    if (FAILED(hr)) {
-        log_win32_error("winrt_initialize", HRESULT_CODE(hr));
-        return 0;
-    }
-#endif
+    freopen(NULL, "wb", stdout);
+    // windows does not have _IOLBF per-se
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     if (argc != 3) {
         log_error("invalid number of arguments: %d", argc);
@@ -518,13 +505,6 @@ int main(int argc, char **argv) {
     snprintf(config.class, MAX_CLASS_SIZE, "%s", argv[2]);
     InitializeCriticalSection(&config.mutex);
     InitializeConditionVariable(&config.config_changed);
-#ifdef ENABLE_ACCENT_REPORT
-    hr = winrt_ui_settings_new(&config.ui_settings);
-    if (FAILED(hr)) {
-        log_win32_error("winrt_ui_settings_new", HRESULT_CODE(hr));
-        goto exit;
-    }
-#endif
     if (!EnumWindows(&enum_window_proc,(LPARAM) &config) && GetLastError() != ERROR_SUCCESS) {
         log_win32_error("EnumWindows", GetLastError());
         goto exit;
@@ -600,10 +580,5 @@ exit:
     if (config.regkey)
         RegCloseKey(config.regkey);
     DeleteCriticalSection(&config.mutex);
-#ifdef ENABLE_ACCENT_REPORT
-    if (config.ui_settings)
-        winrt_ui_settings_free(config.ui_settings);
-    winrt_deinitialize();
-#endif
     return 0;
 }
