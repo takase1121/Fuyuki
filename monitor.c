@@ -443,7 +443,7 @@ static unsigned __stdcall read_input_proc(void *ud) {
                 break;
             }
 
-            log_response(serial, type, "%d", value);
+            log_response(serial, RESPONSE_OK, "%d", value);
         } else if (strcmp(type, CMD_ACCENT) == 0) {
             HRESULT hr;
             DWORD color;
@@ -489,6 +489,7 @@ int main(int argc, char **argv) {
     window_config_t config = { 0 };
     HANDLE thread_handles[3] = { INVALID_HANDLE_VALUE };
 
+    // reopen stdout in binary mode if possible
     freopen(NULL, "wb", stdout);
     // windows does not have _IOLBF per-se
     setvbuf(stdout, NULL, _IONBF, 0);
