@@ -77,6 +77,7 @@ typedef struct window_config_s {
     config_changed_e mask;
     CONDITION_VARIABLE config_changed;
     CRITICAL_SECTION mutex;
+    OSVERSIONINFOEXA version;
     char class[MAX_CLASS_SIZE];
 } window_config_t;
 
@@ -284,20 +285,7 @@ static unsigned __stdcall theme_monitor_proc(void *ud) {
 
 static unsigned __stdcall config_change_proc(void *ud) {
     HRESULT hr;
-    OSVERSIONINFOEXA version;
     window_config_t *config = (window_config_t *) ud;
-
-    // get the OS version so we know how to set the correct attribute later
-    version.dwOSVersionInfoSize = sizeof(version);
-    if (!GetVersionExA((LPOSVERSIONINFOA) &version)) {
-        log_win32_error("GetVersionExA", GetLastError());
-        return 0;
-    }
-
-    if (version.dwBuildNumber < WIN10_BUILD_NUMBER) {
-        log_error("windows build unsupported: %ld", version.dwBuildNumber);
-        return 0;
-    }
 
     for (;;) {
         MARGINS m = { 0 };
@@ -342,7 +330,7 @@ static unsigned __stdcall config_change_proc(void *ud) {
 
         // set window backdrop
         if (config->mask & CONFIG_BACKDROP_TYPE) {
-            if (version.dwBuildNumber >= WIN11_SYSTEMBACKDROP_SUPPORTED_BUILD_NUMBER) {
+            if (config->version.dwBuildNumber >= WIN11_SYSTEMBACKDROP_SUPPORTED_BUILD_NUMBER) {
                 value = config->backdrop_type;
                 hr = DwmSetWindowAttribute(config->window,
                                             DWMWA_SYSTEMBACKDROP_TYPE,
@@ -353,10 +341,9 @@ static unsigned __stdcall config_change_proc(void *ud) {
                     LeaveCriticalSection(&config->mutex);
                     break;
                 }
-            } else if (version.dwBuildNumber < WIN11_SYSTEMBACKDROP_SUPPORTED_BUILD_NUMBER
-                        && config->backdrop_type == BACKDROP_MICA) {
+            } else if (config->version.dwBuildNumber < WIN11_SYSTEMBACKDROP_SUPPORTED_BUILD_NUMBER) {
                 // on older versions we should use another method that only supports mica
-                value = 1;
+                value = config->backdrop_type == BACKDROP_MICA;
                 hr = DwmSetWindowAttribute(config->window,
                                             DWMWA_USE_MICA,
                                             &value,
@@ -413,13 +400,6 @@ static unsigned __stdcall read_input_proc(void *ud) {
                 continue;
             }
 
-            // extend border
-            value = content[0] - '0';
-            if (value != config->extend_border) {
-                config->extend_border = !!value;
-                config->mask |= CONFIG_EXTEND_BORDER;
-            }
-
             // backdrop type
             value = content[1] - '0';
             if (value < 0 || value >= BACKDROP_MAX) {
@@ -427,9 +407,27 @@ static unsigned __stdcall read_input_proc(void *ud) {
                 LeaveCriticalSection(&config->mutex);
                 continue;
             }
+            if ((config->version.dwBuildNumber < WIN11_SYSTEMBACKDROP_SUPPORTED_BUILD_NUMBER
+                    && value != BACKDROP_MICA
+                    && value != BACKDROP_DEFAULT
+                    && value != BACKDROP_NONE)
+                || (config->version.dwBuildNumber < WIN11_BUILD_NUMBER)) {
+                // windows 10 doesn't support backdrop,
+                // certain windows 11 version only supports mica
+                log_response(serial, RESPONSE_ERROR, "backdrop type unsupported by Windows version");
+                LeaveCriticalSection(&config->mutex);
+                continue;
+            }
             if (value != config->backdrop_type) {
                 config->backdrop_type = value;
                 config->mask |= CONFIG_BACKDROP_TYPE;
+            }
+
+            // extend border
+            value = content[0] - '0';
+            if (value != config->extend_border) {
+                config->extend_border = !!value;
+                config->mask |= CONFIG_EXTEND_BORDER;
             }
 
             WakeConditionVariable(&config->config_changed);
@@ -497,6 +495,18 @@ int main(int argc, char **argv) {
 
     if (argc != 3) {
         log_error("invalid number of arguments: %d", argc);
+        return 0;
+    }
+
+    // get the OS version so we know how to set the correct attribute later
+    config.version.dwOSVersionInfoSize = sizeof(config.version);
+    if (!GetVersionExA((LPOSVERSIONINFOA) &config.version)) {
+        log_win32_error("GetVersionExA", GetLastError());
+        return 0;
+    }
+
+    if (config.version.dwBuildNumber < WIN10_BUILD_NUMBER) {
+        log_error("windows build unsupported: %ld", config.version.dwBuildNumber);
         return 0;
     }
 
