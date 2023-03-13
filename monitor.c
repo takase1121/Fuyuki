@@ -48,6 +48,7 @@ uintptr_t _beginthreadex( // NATIVE CODE
 #define RESPONSE_OK "ok"
 #define RESPONSE_ERROR "error"
 
+#define BROADCAST_ACCENTCHANGE "accentchange"
 #define BROADCAST_THEMECHANGE "themechange"
 #define BROADCAST_ERROR "error"
 #define BROADCAST_READY "ready"
@@ -200,68 +201,91 @@ static LSTATUS is_dark_mode(HKEY regkey, int *is_dark) {
 }
 
 
+#define ARGB_RGBA(V) ((((V) & 0xFF000000) >> 24) | (((V) & 0x00FFFFFF) << 8))
+
+
+LRESULT CALLBACK theme_monitor_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    CREATESTRUCTA *cs;
+    window_config_t *config = (window_config_t *) GetWindowLongPtr(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_NCCREATE:
+        cs = (CREATESTRUCTA *) lparam;
+        SetLastError(0);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR) cs->lpCreateParams);
+        return GetLastError() == ERROR_SUCCESS;
+
+    case WM_SETTINGCHANGE:
+        if (lparam && strcmp((char *) lparam, "ImmersiveColorSet") == 0) {
+            // theme changed
+            int value = 0;
+            LRESULT rc;
+            EnterCriticalSection(&config->mutex);
+            if ((rc = is_dark_mode(config->regkey, &value)) != ERROR_SUCCESS) {
+                log_win32_error("is_dark_mode", rc);
+                LeaveCriticalSection(&config->mutex);
+                return FALSE;
+            }
+            if (value != config->dark_mode) {
+                config->dark_mode = value;
+                config->mask |= CONFIG_DARK_MODE;
+                log_broadcast(BROADCAST_THEMECHANGE, "%d", config->dark_mode);
+                WakeConditionVariable(&config->config_changed);
+            }
+            LeaveCriticalSection(&config->mutex);
+            return FALSE;
+        }
+        break;
+
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+        // lock the mutex so we don't interrupt a response
+        EnterCriticalSection(&config->mutex);
+        log_broadcast(BROADCAST_ACCENTCHANGE, "%d %lu", (BOOL) lparam, ARGB_RGBA((DWORD) wparam));
+        LeaveCriticalSection(&config->mutex);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wparam, lparam);
+}
+
+
 static unsigned __stdcall theme_monitor_proc(void *ud) {
-    int value;
-    HANDLE ev;
-    LRESULT rc;
+    MSG msg;
+    WNDCLASS wc = { 0 };
+    HWND dummy_window = NULL;
+    char class_name[] = "dummy";
     window_config_t *config = (window_config_t *) ud;
 
-    ev = CreateEventA(NULL, FALSE, FALSE, NULL);
-    if (!ev) {
-        log_win32_error("CreateEventA", GetLastError());
+    wc.lpfnWndProc = &theme_monitor_wndproc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = class_name;
+
+    if (!RegisterClassA(&wc)) {
+        log_win32_error("RegisterClassA", GetLastError());
+        return 0;
+    }
+    dummy_window = CreateWindowExA(0,
+                                    class_name,
+                                    class_name,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    NULL,
+                                    NULL,
+                                    NULL,
+                                    ud);
+    if (!dummy_window) {
+        log_win32_error("CreateWindowExA", GetLastError());
         return 0;
     }
 
-    for (;;) {
-        // we must call LeaveCriticalSection when we decided to break
-        // Get an event so that we can unlock the mutex and wait
-        EnterCriticalSection(&config->mutex);
-
-        if (!config->regkey) {
-            LeaveCriticalSection(&config->mutex);
-            break;
-        }
-
-        rc = RegNotifyChangeKeyValue(config->regkey,
-                                        FALSE,
-                                        REG_NOTIFY_CHANGE_LAST_SET,
-                                        ev,
-                                        TRUE);
-        if (rc != ERROR_SUCCESS) {
-            log_win32_error("RegNotifyChangeKeyValue", rc);
-            LeaveCriticalSection(&config->mutex);
-            break;
-        }
-
-        LeaveCriticalSection(&config->mutex);
-
-        // wait for the mutex
-        WaitForSingleObject(ev, INFINITE);
-
-        // read the config
-        EnterCriticalSection(&config->mutex);
-
-        if (!config->regkey) {
-            LeaveCriticalSection(&config->mutex);
-            break;
-        }
-
-        rc = is_dark_mode(config->regkey, &value);
-        if (rc != ERROR_SUCCESS) {
-            log_win32_error("RegQueryValueEx", rc);
-            LeaveCriticalSection(&config->mutex);
-            break;
-        }
-
-        if (value != config->dark_mode) {
-            config->dark_mode = value;
-            config->mask |= CONFIG_DARK_MODE;
-            log_broadcast(BROADCAST_THEMECHANGE, "%d", config->dark_mode);
-            WakeConditionVariable(&config->config_changed);
-        }
-
-        LeaveCriticalSection(&config->mutex);
+    while (GetMessageA(&msg, dummy_window, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
     }
+
+    DestroyWindow(dummy_window);
     return 0;
 }
 
