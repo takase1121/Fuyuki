@@ -454,31 +454,18 @@ static unsigned __stdcall read_input_proc(void *ud) {
             }
 
             log_response(serial, type, "%d", value);
-#ifdef ENABLE_ACCENT_REPORT
         } else if (strcmp(type, CMD_ACCENT) == 0) {
-            int type;
             HRESULT hr;
-            uint32_t value = 0;
+            DWORD color;
+            BOOL opaque;
 
-            if (strlen(content) != 1) {
-                log_response(serial, RESPONSE_ERROR, "invalid length: %d", strlen(content));
+            hr = DwmGetColorizationColor(&color, &opaque);
+            if (FAILED(hr)) {
+                log_win32_response(serial, RESPONSE_ERROR, "DwmGetColorizationColor", HRESULT_CODE(hr));
                 LeaveCriticalSection(&config->mutex);
-                continue;
+                break;
             }
-
-            type = content[0] - '0';
-            if (type > COLOR_TYPE_MIN && type < COLOR_TYPE_MAX) {
-                hr = winrt_ui_settings_get_color(config->ui_settings, type, &value);
-                if (FAILED(hr)) {
-                    log_win32_response(serial, RESPONSE_ERROR, "winrt_ui_settings_get_color", HRESULT_CODE(hr));
-                    LeaveCriticalSection(&config->mutex);
-                    break;
-                }
-                log_response(serial, RESPONSE_OK, "%u", value);
-            } else {
-                log_response(serial, RESPONSE_ERROR, "invalid type: %c", content[0]);
-            }
-#endif
+            log_response(serial, RESPONSE_OK, "%d %lu", opaque, ARGB_RGBA(color));
         } else if (strcmp(type, CMD_EXIT) == 0) {
             log_response(serial, RESPONSE_OK, "");
             LeaveCriticalSection(&config->mutex);
